@@ -20,6 +20,15 @@
 #include "AudioProducer.h"
 
 #include <iostream>
+#include <QtEndian>
+//#include <time.h>
+#include <thread>
+// #include <mutex>
+
+// std::mutex write_buffer_lock;
+
+static const int SR = 44100;
+double duration = 3;
 
 using namespace std;
 
@@ -31,6 +40,10 @@ class ClickSoundViewer : public QGLViewer
 ////////////////////////////////////////////////////////
         void sim_click(const QPoint& selected_point);
         void generate_sounds();
+        void generate_continuous();
+        bool                gui;
+        bool                continuous;
+        std::vector<double> whole_soundBuffer;
 ///////////////////////////////////////////////////////
 
 
@@ -53,7 +66,7 @@ class ClickSoundViewer : public QGLViewer
         void draw_mesh();
         void draw_obj();
         void draw_triangle_normal();
-
+        void run_thread(double collision_time, int selTriId, Vector3d nml,Point3d CamPos,float amp,int index_t);
     private:
         QDir                dataDir_;
         bool                wireframe_;
@@ -62,8 +75,15 @@ class ClickSoundViewer : public QGLViewer
 ///////////////////////////////////////////////////////////////////////////////
         Point3d             default_CamPos;
         QString             selected_Tris;
+        QString             amplitudes;
+        QString             collision_times;
+        QString             norm1s;
+        QString             norm2s;
+        QString             norm3s;
+        QString             camXs;
+        QString             camYs;
+        QString             camZs;
 ///////////////////////////////////////////////////////////////////////////////
-
 
 
         AudioProducer*      audio_;
@@ -103,7 +123,18 @@ ClickSoundViewer::ClickSoundViewer(const char* inifile) :
     default_CamPos.y = settings.value("camera/y").toDouble();
     default_CamPos.z = settings.value("camera/z").toDouble();
 
-    selected_Tris = settings.value("triIDs/ID").toString();
+    selected_Tris = settings.value("collisions/ID").toString();
+    amplitudes = settings.value("collisions/amplitude").toString();
+    collision_times = settings.value("collisions/time").toString();
+
+    gui = settings.value("gui/gui").toBool();
+    continuous = settings.value("audio/continuous").toBool();
+    norm1s = settings.value("collisions/norm1").toString();
+    norm2s = settings.value("collisions/norm2").toString();
+    norm3s = settings.value("collisions/norm3").toString();
+    camXs = settings.value("collisions/camX").toString();
+    camYs = settings.value("collisions/camY").toString();
+    camZs = settings.value("collisions/camZ").toString();
 ///////////////////////////////////////////////////////////////////////////////
 }
 
@@ -131,6 +162,8 @@ void ClickSoundViewer::init()
     init_gl();      // initialize OpenGL
 
     resize(1024, 756);
+    // const qglviewer::Vec camPos(0,1,10);
+    // camera()->setPosition(camPos);
     camera()->setZNearCoefficient(0.0001f);
     camera()->setZClippingCoefficient(100.f);
 }
@@ -241,7 +274,8 @@ void ClickSoundViewer::postSelection(const QPoint& point)
                 vtx[tgl[selTriId_].y],
                 vtx[tgl[selTriId_].z] );
         nml.normalize();
-        audio_->play( mesh_.triangle_ids(selTriId_), nml, camPos );
+        // nml*=10;
+        audio_->play( mesh_.triangle_ids(selTriId_), nml, camPos, 1 );
     }
 
     if ( selTriId_ >= 0 ) updateGL();
@@ -293,9 +327,15 @@ void ClickSoundViewer::generate_sounds()
 {
   // generate wav file for every selected Tri specified in .ini file
     QStringList selTriIds = selected_Tris.split(" ");
+    QStringList Amps = amplitudes.split(" ");
+
+    if (selTriIds.size()!=Amps.size())
+        PRINT_ERROR("Number of selected Tri should equal to number of amplitudes");
 
     for (int i = 0; i < selTriIds.size(); ++i){
         int selTriId = selTriIds.at(i).toInt();
+        double amp = Amps.at(i).toDouble();
+
         const vector<Point3d>&  vtx = mesh_.vertices();
         const vector<Tuple3ui>& tgl = mesh_.surface_indices();
         Vector3d nml = Triangle<double>::normal(
@@ -303,12 +343,128 @@ void ClickSoundViewer::generate_sounds()
                 vtx[tgl[selTriId].y],
                 vtx[tgl[selTriId].z] );
         nml.normalize();
-        audio_->play( mesh_.triangle_ids(selTriId), nml, default_CamPos );
+        audio_->play( mesh_.triangle_ids(selTriId), nml, default_CamPos, amp );
     }
 }
+
+void ClickSoundViewer::run_thread(double collision_time,int selTriId, Vector3d nml,Point3d CamPos,float amp,int index_t)
+{
+
+    audio_->single_channel_synthesis(mesh_.triangle_ids(selTriId), nml, CamPos, amp, index_t);
+
+    // std::lock_guard<std::mutex> lock(write_buffer_lock);
+    for (int j=0; j < audio_->soundBuffer_[index_t].size(); ++j){
+        whole_soundBuffer.at(SR*collision_time*audio_->format_.channelCount() + j) += audio_->soundBuffer_[index_t].at(j);
+    }
+}
+
+void ClickSoundViewer::generate_continuous()
+{   
+    
+
+    QStringList selTriIds = selected_Tris.split(" ");
+    QStringList Amps = amplitudes.split(" ");
+    QStringList times = collision_times.split(" ");
+    QStringList normal1s = norm1s.split(" ");
+    QStringList normal2s = norm2s.split(" ");
+    QStringList normal3s = norm3s.split(" ");
+    QStringList camPosXs = camXs.split(" ");
+    QStringList camPosYs = camYs.split(" ");
+    QStringList camPosZs = camZs.split(" ");
+
+    double final_time = times.at(times.size()-1).toDouble();//time of the last collision
+
+    //const qint64 len = ( (SR*final_time* audio_->format_.channelCount()* format_.sampleSize() / 8 + SR * audio_->TS * audio_->format_.channelCount()) * audio_->format_.sampleSize() / 8);
+    const qint64 len = SR* (int)duration * audio_->format_.sampleSize() / 8;
+    QByteArray buffer;
+    buffer.resize(len);
+
+//    std::vector<double> whole_soundBuffer;
+    //TODO: convert resize(number) number from double to int?
+    cout<<"ChannelCount: "<<audio_->format_.channelCount()<<endl;
+    //whole_soundBuffer.resize( SR*final_time* audio_->format_.channelCount() + SR * audio_->TS * audio_->format_.channelCount() );
+    whole_soundBuffer.resize( std::max(SR*final_time* audio_->format_.channelCount() + SR * audio_->TS * audio_->format_.channelCount(),SR*duration) );
+
+    //cout<<"1\n";
+    cout<<"Num clicks: "<<selTriIds.size()<<"\n";
+    
+    std::thread ts[NUM_THREADS];
+    int running_threads = 0;
+
+    for (int i = 0; i < selTriIds.size(); ++i){
+        int index_t = i%NUM_THREADS;
+        int selTriId = selTriIds.at(i).toInt();
+        double amp = Amps.at(i).toDouble()/16;
+        double collision_time = times.at(i).toDouble();
+
+        if(collision_time > duration)
+            break;
+
+        const vector<Point3d>&  vtx = mesh_.vertices();
+        const vector<Tuple3ui>& tgl = mesh_.surface_indices();
+        Vector3d nml = Triangle<double>::normal(
+                vtx[tgl[selTriId].x],
+                vtx[tgl[selTriId].y],
+                vtx[tgl[selTriId].z] );
+        // Vector3d nml(normal1s.at(i).toDouble(),normal2s.at(i).toDouble(),normal3s.at(i).toDouble());
+        nml.normalize();
+
+        Point3d CamPos;
+        CamPos.x = camPosXs.at(i).toDouble();
+        CamPos.y = camPosYs.at(i).toDouble();
+        CamPos.z = camPosZs.at(i).toDouble();
+        //cout<<"------\n";
+        ts[index_t] = std::thread(&ClickSoundViewer::run_thread,this,collision_time, selTriId, nml, CamPos, amp, index_t);
+        running_threads+=1;
+
+        // if( i%NUM_THREADS == NUM_THREADS-1 || i==selected_Tris.size()-1){
+        if( (i==selTriIds.size()-1) || i%NUM_THREADS==NUM_THREADS-1  ){
+            for(int nt =0; nt< running_threads; ++nt){
+                ts[nt].join();
+            } 
+            running_threads = 0;
+        }
+//        audio_->single_channel_synthesis(mesh_.triangle_ids(selTriId), nml, CamPos, amp, index_t);
+        
+        //cout<<"======\n";
+
+//        for (int j=0; j < audio_->soundBuffer_[index_t].size(); ++j){
+//            whole_soundBuffer.at(SR*collision_time*audio_->format_.channelCount() + j) += audio_->soundBuffer_[index_t].at(j);
+    }
+
+
+
+
+// new code with ch=1 starts from here
+    std::vector<double> whole_soundBuffer_crop(&whole_soundBuffer[0],&whole_soundBuffer[SR*duration]);
+
+    unsigned char *ptr = reinterpret_cast<unsigned char *>(buffer.data());
+    const int channelBytes = audio_->format_.sampleSize() / 8;
+    for(int ti = 0;ti < whole_soundBuffer_crop.size();++ ti)
+    {
+        const qint16 value = static_cast<qint16>( whole_soundBuffer_crop[ti] * 32767 );
+        qToLittleEndian<qint16>(value, ptr);
+        ptr += channelBytes;
+    }
+
+    audio_->generate_continuous_wav(buffer,whole_soundBuffer_crop);
+// end
+
+    // unsigned char *ptr = reinterpret_cast<unsigned char *>(buffer.data());
+    // const int channelBytes = audio_->format_.sampleSize() / 8;
+    // for(int ti = 0;ti < whole_soundBuffer.size();++ ti)
+    // {
+    //     const qint16 value = static_cast<qint16>( whole_soundBuffer[ti] * 32767 );
+    //     qToLittleEndian<qint16>(value, ptr);
+    //     ptr += channelBytes;
+    // }
+    //
+    // audio_->generate_continuous_wav(buffer,whole_soundBuffer);
+
+
+}
+
 ///////////////////////////////////////////////////////////////////////////////
-
-
 
 
 static void list_audio_devices()
@@ -321,6 +477,7 @@ static void list_audio_devices()
 
 int main(int argc, char* argv[])
 {
+    //clock_t start = clock();
     if ( argc != 2 )
     {
         cerr << "Invalid arguments!" << endl;
@@ -335,13 +492,17 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+    //cout<<"generating QApp and ClickSoundViewer\n";
     QApplication app(argc, argv);
     ClickSoundViewer viewer(argv[1]);
 
     //viewer.setWindowTitle(title.c_str());
-    // viewer.show();
 
 ////////////////////////////////////////////////////////////////////////
+    if(viewer.gui){
+        viewer.show();
+        return app.exec();
+    }
     // QPoint selected_point;
     // selected_point.setX(515);
     // selected_point.setY(384);
@@ -350,9 +511,19 @@ int main(int argc, char* argv[])
     // const Point3d camPos(100,100,100);
     // const int selTriId_=500;
     // viewer.sim_click2(camPos, selTriId_);
-    viewer.generate_sounds();
+    //cout <<"start to generate sound\n";
+    if(!viewer.continuous){
+        viewer.generate_sounds();
+    }
+    else
+        viewer.generate_continuous();
 ////////////////////////////////////////////////////////////////////////
 
+    app.exit(0);
+    //clock_t end = clock();
+    //float sec = (float)((float)end-(float)start)/(float)CLOCKS_PER_SEC;
+    //cout<<"time usage: "<<sec<<"\n";
 
-    return app.exec();
+    return 0;
+
 }
